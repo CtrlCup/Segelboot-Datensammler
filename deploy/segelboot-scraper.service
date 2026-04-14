@@ -1,0 +1,18 @@
+[Unit]
+Description=Segelboot-Datensammler (einmaliger Scrape-Lauf)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# User, unter dem das Skript laeuft — anpassen!
+User=REPLACE_USER
+# Projekt-Verzeichnis — anpassen!
+WorkingDirectory=/opt/segelboot-scraper
+ExecStart=/opt/segelboot-scraper/.venv/bin/python /opt/segelboot-scraper/main.py
+# Optional: Logs nach journald
+StandardOutput=journal
+StandardError=journal
+# Resource-Limits (sanft)
+Nice=10
+TimeoutStartSec=6h

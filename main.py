@@ -13,10 +13,11 @@ import logging
 import sqlite3
 import sys
 
-from config import ACTIVE_SCRAPERS, MAX_PREIS_EUR, MIN_PREIS_EUR
+from config import ACTIVE_SCRAPERS, MAX_PREIS_EUR, MIN_PREIS_EUR, WEBDAV
 from database import boat_exists, compute_dedupe_hash, get_boat_count, get_connection, init_db, insert_boat, update_zuletzt_gesehen
 from scraper import SCRAPER_REGISTRY
 from scraper.base import BaseScraper
+import webdav_sync
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,6 +124,12 @@ def main() -> None:
     logger.info("Aktive Scraper: %s", ", ".join(ACTIVE_SCRAPERS))
     logger.info("=" * 60)
 
+    if WEBDAV.get("enabled"):
+        try:
+            webdav_sync.pull()
+        except Exception as e:
+            logger.error("WebDAV-Pull fehlgeschlagen: %s", e)
+
     init_db()
     conn = get_connection()
 
@@ -152,6 +159,12 @@ def main() -> None:
     logger.info("  Fehler:            %d", total_stats["fehler"])
     logger.info("  Boote in DB:       %d (vorher: %d)", count_after, count_before)
     logger.info("=" * 60)
+
+    if WEBDAV.get("enabled"):
+        try:
+            webdav_sync.push()
+        except Exception as e:
+            logger.error("WebDAV-Push fehlgeschlagen: %s", e)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,13 @@
+[Unit]
+Description=Segelboot-Datensammler zweimal taeglich starten
+
+[Timer]
+# Zwei Startzeiten pro Tag — nach Bedarf aendern.
+OnCalendar=*-*-* 07:00:00
+OnCalendar=*-*-* 19:00:00
+# Falls der Server zur Startzeit aus war: nachholen
+Persistent=true
+Unit=segelboot-scraper.service
+
+[Install]
+WantedBy=timers.target

@@ -26,9 +26,28 @@ REQUEST_TIMEOUT = 30  # Sekunden
 
 # Aktive Scraper — hier Plattformen ein-/ausschalten
 ACTIVE_SCRAPERS = [
-    "boat24",
-    "boatshop24",
+    #"boat24",
+    #"boatshop24",
     # "bootsboerse",  # Seite offline (SSL/Connection refused)
-    "yachtworld",
+    #"yachtworld",
     # "scanboat",
 ]
+
+# ── WebDAV-Synchronisation ───────────────────────────────────────────
+# Zugangsdaten stehen in `webdav_config.py` (gitignored). Fehlt die Datei,
+# wird das Template `webdav_config.example.py` mit deaktiviertem Sync
+# verwendet.
+try:
+    from webdav_config import WEBDAV  # noqa: F401
+except ImportError:
+    WEBDAV = {
+        "enabled": False,
+        "hostname": "",
+        "login": "",
+        "password": "",
+        "remote_path": "/Segelboot-Datensammler",
+        "pull_on_start": True,
+        "push_on_end": True,
+        "verify_ssl": True,
+        "timeout": 60,
+    }

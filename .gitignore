@@ -29,3 +29,6 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Lokale WebDAV-Zugangsdaten (NICHT committen)
+webdav_config.py

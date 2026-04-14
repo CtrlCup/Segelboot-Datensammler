@@ -12,11 +12,11 @@ Scraper-Pipeline, die Segelboot-Inserate von mehreren internationalen Plattforme
 | [Bootsboerse](https://www.bootsboerse.de) | `scraper/bootsboerse.py` | pausiert (Seite offline) |
 | [Scanboat](https://www.scanboat.com) | `scraper/scanboat.py` | pausiert |
 
-## Installation
+## Installation (lokal)
 
 ```bash
-git clone https://github.com/<user>/segelboot-datensammler.git
-cd segelboot-datensammler
+git clone https://github.com/CtrlCup/Segelboot-Datensammler.git
+cd Segelboot-Datensammler
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -30,6 +30,39 @@ python main.py
 ```
 
 Das Skript durchläuft alle aktiven Plattformen, sammelt Inserate im konfigurierten Preisbereich und speichert sie in `data/segelboote.db`. Bilder werden nach `images/{boot_id}/` heruntergeladen.
+
+## Installation auf einem Ubuntu-Server (Hintergrundbetrieb)
+
+Für Dauerbetrieb mit automatischem Start zu festen Uhrzeiten. Komplette Anleitung in [DEPLOYMENT.md](DEPLOYMENT.md).
+
+Kurzfassung:
+
+```bash
+sudo mkdir -p /opt/segelboot-scraper && sudo chown $USER:$USER /opt/segelboot-scraper
+git clone https://github.com/CtrlCup/Segelboot-Datensammler.git /opt/segelboot-scraper
+cd /opt/segelboot-scraper
+
+bash deploy/setup_ubuntu.sh                 # venv + requirements + Ordner
+nano webdav_config.py                       # pCloud-Zugangsdaten eintragen
+
+sed -i "s/REPLACE_USER/$USER/" deploy/segelboot-scraper.service
+sudo cp deploy/segelboot-scraper.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now segelboot-scraper.timer
+```
+
+Der Scraper läuft dann automatisch zweimal täglich (Standard: 07:00 & 19:00). Zeiten lassen sich in `/etc/systemd/system/segelboot-scraper.timer` anpassen.
+
+### Komplett deinstallieren
+
+Ein Skript entfernt systemd-Units, venv und (optional) Daten:
+
+```bash
+cd /opt/segelboot-scraper
+sudo bash deploy/uninstall_ubuntu.sh
+```
+
+Das Skript fragt nach, ob `data/` und `images/` ebenfalls gelöscht werden sollen. Details in [DEPLOYMENT.md](DEPLOYMENT.md#deinstallation).
 
 ## Konfiguration
 
@@ -47,6 +80,10 @@ Alle Einstellungen befinden sich in `config.py`:
 ├── database.py          # SQLite-Schema, Insert/Deduplizierung
 ├── models.py            # BoatListing-Dataclass
 ├── requirements.txt     # Python-Abhängigkeiten
+├── webdav_sync.py       # WebDAV-Synchronisation (DB + Bilder)
+├── webdav_config.example.py  # Vorlage für Zugangsdaten
+├── deploy/              # Ubuntu-Setup, systemd-Unit + Timer, Uninstaller
+├── DEPLOYMENT.md        # Server-Deployment-Anleitung
 ├── scraper/
 │   ├── __init__.py      # SCRAPER_REGISTRY
 │   ├── base.py          # BaseScraper-ABC mit HTTP, Bilddownload, Parsing
