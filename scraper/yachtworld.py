@@ -4,13 +4,19 @@ import logging
 import random
 import re
 import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
+from config import BASE_DIR
 from models import BoatListing
 from scraper.base import BaseScraper
 
 logger = logging.getLogger(__name__)
+
+DEBUG_DIR = BASE_DIR / "debug"
 
 
 def _run_async(coro):
@@ -33,7 +39,7 @@ class YachtworldScraper(BaseScraper):
 
     BASE_URL = "https://www.yachtworld.com"
     SEARCH_URL = (
-        "https://www.yachtworld.com/boats-for-sale/type/sail/"
+        "https://www.yachtworld.com/boats-for-sale/type-sail/"
         "?currency=EUR&price=EUR-0-{max_price}&page={page}"
     )
 
@@ -43,6 +49,7 @@ class YachtworldScraper(BaseScraper):
         self._page = None
         # Pre-populated data from search results (URL → ssr-meta dict)
         self._search_meta: dict[str, dict] = {}
+        self._maintenance = False
 
     # ── Browser management ──────────────────────────────────────────
 
@@ -54,6 +61,9 @@ class YachtworldScraper(BaseScraper):
 
     async def _navigate(self, url: str, wait_selector: str = "") -> str:
         """Navigate in the same tab (preserves Cloudflare session cookies)."""
+        if self._maintenance:
+            raise RuntimeError("yachtworld maintenance mode")
+
         browser = await self._ensure_browser()
 
         if self._page is None:
@@ -61,25 +71,80 @@ class YachtworldScraper(BaseScraper):
         else:
             await self._page.get(url)
 
+        # Quick check: BoatsGroup maintenance page (static HTML, HTTP 200)
+        await asyncio.sleep(2)
+        try:
+            title = await self._page.evaluate("document.title || ''")
+            if isinstance(title, str) and title.strip().lower() == "maintenance":
+                self._maintenance = True
+                logger.warning("[yachtworld] Wartungsseite erkannt — breche ab")
+                raise RuntimeError("yachtworld maintenance mode")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
         # Phase 1: Wait for Cloudflare challenge to resolve
         for _ in range(20):
             await asyncio.sleep(3)
-            title = await self._page.evaluate("document.title")
-            if title and "moment" not in title.lower() and "checking" not in title.lower():
-                break
+            try:
+                ready = await self._page.evaluate("""
+                    (() => {
+                        const t = document.title || '';
+                        const body = document.body ? document.body.innerText.length : 0;
+                        const cf = document.querySelector(
+                            '#challenge-running, #challenge-stage, .cf-browser-verification, '
+                            + 'iframe[src*="challenges.cloudflare"], iframe[title*="challenge"], '
+                            + '#cf-challenge-running, [data-translate="checking_browser"]'
+                        );
+                        if (cf) return false;
+                        const tl = t.toLowerCase();
+                        if (tl.includes('moment') || tl.includes('checking')
+                            || tl.includes('attention required') || tl.includes('verify')) return false;
+                        return body > 100;
+                    })()
+                """)
+                if ready is True:
+                    break
+            except Exception:
+                pass
         else:
             logger.warning("[yachtworld] Cloudflare-Challenge nicht gelöst für %s", url)
+            await self._dump_debug(url, "cf_unresolved")
             return await self._page.evaluate("document.documentElement.outerHTML")
+
+        # Accept cookie consent if present
+        try:
+            await self._page.evaluate("""
+                (() => {
+                    const btns = document.querySelectorAll('button');
+                    for (const btn of btns) {
+                        const text = btn.innerText.toLowerCase();
+                        if (text.includes('alle akzeptieren') || text.includes('accept all')
+                            || text.includes('accept') || text.includes('akzeptieren')) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                })()
+            """)
+            await asyncio.sleep(2)
+        except Exception:
+            pass
 
         # Phase 2: Wait for content to render
         if wait_selector:
             for _ in range(10):
                 await asyncio.sleep(2)
-                found = await self._page.evaluate(
-                    f"document.querySelectorAll('{wait_selector}').length"
-                )
-                if found and found > 0:
-                    break
+                try:
+                    found = await self._page.evaluate(
+                        f"document.querySelectorAll('{wait_selector}').length"
+                    )
+                    if isinstance(found, (int, float)) and found > 0:
+                        break
+                except Exception:
+                    pass
         else:
             await asyncio.sleep(5)
 
@@ -90,10 +155,30 @@ class YachtworldScraper(BaseScraper):
         delay = random.uniform(4.0, 7.0)
         time.sleep(delay)
 
+    async def _dump_debug(self, url: str, tag: str) -> None:
+        """Save HTML + screenshot for offline inspection of Cloudflare failures."""
+        try:
+            out_dir = DEBUG_DIR / "yachtworld"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            slug = re.sub(r"[^a-zA-Z0-9]+", "_", urlparse(url).path)[:80].strip("_") or "root"
+            base = out_dir / f"{ts}_{tag}_{slug}"
+            html = await self._page.evaluate("document.documentElement.outerHTML")
+            Path(str(base) + ".html").write_text(html or "", encoding="utf-8")
+            try:
+                await self._page.save_screenshot(str(base) + ".png")
+            except Exception as e:
+                logger.debug("[yachtworld] Screenshot fehlgeschlagen: %s", e)
+            logger.info("[yachtworld] Debug-Dump: %s.{html,png}", base)
+        except Exception as e:
+            logger.debug("[yachtworld] Debug-Dump fehlgeschlagen: %s", e)
+
     # ── BaseScraper overrides ───────────────────────────────────────
 
     def fetch_page(self, url: str) -> BeautifulSoup | None:
         """Load a page via headless Chrome (nodriver)."""
+        if self._maintenance:
+            return None
         try:
             html = _run_async(self._navigate(
                 url, wait_selector='script[type="application/ld+json"]'
@@ -129,7 +214,7 @@ class YachtworldScraper(BaseScraper):
 
             try:
                 html = _run_async(self._navigate(
-                    search_url, wait_selector="a.grid-listing-link"
+                    search_url, wait_selector="a.grid-listing-link, a[href*='/yacht/']"
                 ))
             except Exception as e:
                 logger.warning("[yachtworld] Fehler Suchseite %d: %s", page, e)
@@ -157,17 +242,27 @@ class YachtworldScraper(BaseScraper):
         soup = BeautifulSoup(html, "html.parser")
         urls = []
 
-        all_links = soup.select("a.grid-listing-link")
+        all_links = soup.select("a.grid-listing-link, a[href*='/yacht/']")
+        # Deduplicate by href
+        seen_hrefs = set()
+        unique_links = []
+        for link in all_links:
+            href = link.get("href", "")
+            if href and href not in seen_hrefs:
+                seen_hrefs.add(href)
+                unique_links.append(link)
+        all_links = unique_links
         logger.info("[yachtworld] %d Listing-Cards auf der Seite gefunden", len(all_links))
 
         for link in all_links:
             href = link.get("href", "")
             ssr_meta = link.get("data-ssr-meta", "")
 
-            if "sail-" not in ssr_meta.lower():
+            # Skip power boats if ssr-meta is available
+            if ssr_meta and "sail" not in ssr_meta.lower():
                 continue
 
-            if not href:
+            if not href or ("/boat/" not in href and "/yacht/" not in href):
                 continue
 
             full_url = href if href.startswith("http") else self.BASE_URL + href

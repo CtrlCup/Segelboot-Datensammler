@@ -13,6 +13,9 @@ build/
 data/
 images/
 
+# Debug artifacts from scraper failures
+debug/
+
 # IDE
 .vscode/
 .idea/

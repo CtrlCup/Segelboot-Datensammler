@@ -4,14 +4,19 @@ import logging
 import random
 import re
 import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
-from config import MIN_PREIS_EUR
+from config import BASE_DIR, MIN_PREIS_EUR
 from models import BoatListing
 from scraper.base import BaseScraper
 
 logger = logging.getLogger(__name__)
+
+DEBUG_DIR = BASE_DIR / "debug"
 
 
 def _run_async(coro):
@@ -33,10 +38,10 @@ class Boatshop24Scraper(BaseScraper):
     platform_name = "boatshop24.com"
 
     BASE_URL = "https://www.boatshop24.com"
-    # URL-based price filter: currency-eur/price-{min}-{max}
+    # Query-parameter price filter
     SEARCH_URL = (
         "https://www.boatshop24.com/boats-for-sale/"
-        "class-sailing-boats/currency-eur/price-{min_price}-{max_price}/page-{page}/"
+        "class-sailing-boats/?currency=EUR&price={min_price}-{max_price}&page={page}"
     )
     MAX_PAGES = 200
 
@@ -45,6 +50,7 @@ class Boatshop24Scraper(BaseScraper):
         self._browser = None
         self._page = None
         self._search_meta: dict[str, dict] = {}
+        self._maintenance = False
 
     # ── Browser management ──────────────────────────────────────────
 
@@ -56,6 +62,9 @@ class Boatshop24Scraper(BaseScraper):
 
     async def _navigate(self, url: str, wait_selector: str = "") -> str:
         """Navigate in the same tab (preserves Cloudflare session cookies)."""
+        if self._maintenance:
+            raise RuntimeError("boatshop24 maintenance mode")
+
         browser = await self._ensure_browser()
 
         if self._page is None:
@@ -63,25 +72,80 @@ class Boatshop24Scraper(BaseScraper):
         else:
             await self._page.get(url)
 
-        # Wait for Cloudflare challenge to resolve
+        # Quick check: BoatsGroup maintenance page (static HTML, HTTP 200)
+        await asyncio.sleep(2)
+        try:
+            title = await self._page.evaluate("document.title || ''")
+            if isinstance(title, str) and title.strip().lower() == "maintenance":
+                self._maintenance = True
+                logger.warning("[boatshop24] Wartungsseite erkannt — breche ab")
+                raise RuntimeError("boatshop24 maintenance mode")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        # Wait for Cloudflare challenge to resolve — check both title and body content
         for _ in range(20):
             await asyncio.sleep(3)
-            title = await self._page.evaluate("document.title")
-            if title and "moment" not in title.lower() and "checking" not in title.lower():
-                break
+            try:
+                ready = await self._page.evaluate("""
+                    (() => {
+                        const t = document.title || '';
+                        const body = document.body ? document.body.innerText.length : 0;
+                        const cf = document.querySelector(
+                            '#challenge-running, #challenge-stage, .cf-browser-verification, '
+                            + 'iframe[src*="challenges.cloudflare"], iframe[title*="challenge"], '
+                            + '#cf-challenge-running, [data-translate="checking_browser"]'
+                        );
+                        if (cf) return false;
+                        const tl = t.toLowerCase();
+                        if (tl.includes('moment') || tl.includes('checking')
+                            || tl.includes('attention required') || tl.includes('verify')) return false;
+                        return body > 100;
+                    })()
+                """)
+                if ready is True:
+                    break
+            except Exception:
+                pass
         else:
             logger.warning("[boatshop24] Cloudflare-Challenge nicht gelöst für %s", url)
+            await self._dump_debug(url, "cf_unresolved")
             return await self._page.evaluate("document.documentElement.outerHTML")
+
+        # Accept cookie consent if present
+        try:
+            await self._page.evaluate("""
+                (() => {
+                    const btns = document.querySelectorAll('button');
+                    for (const btn of btns) {
+                        const text = btn.innerText.toLowerCase();
+                        if (text.includes('alle akzeptieren') || text.includes('accept all')
+                            || text.includes('accept') || text.includes('akzeptieren')) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                })()
+            """)
+            await asyncio.sleep(2)
+        except Exception:
+            pass
 
         # Wait for content to render
         if wait_selector:
             for _ in range(10):
                 await asyncio.sleep(2)
-                found = await self._page.evaluate(
-                    f"document.querySelectorAll('{wait_selector}').length"
-                )
-                if found and found > 0:
-                    break
+                try:
+                    found = await self._page.evaluate(
+                        f"document.querySelectorAll('{wait_selector}').length"
+                    )
+                    if isinstance(found, (int, float)) and found > 0:
+                        break
+                except Exception:
+                    pass
         else:
             await asyncio.sleep(5)
 
@@ -91,10 +155,30 @@ class Boatshop24Scraper(BaseScraper):
         delay = random.uniform(4.0, 7.0)
         time.sleep(delay)
 
+    async def _dump_debug(self, url: str, tag: str) -> None:
+        """Save HTML + screenshot for offline inspection of Cloudflare failures."""
+        try:
+            out_dir = DEBUG_DIR / "boatshop24"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            slug = re.sub(r"[^a-zA-Z0-9]+", "_", urlparse(url).path)[:80].strip("_") or "root"
+            base = out_dir / f"{ts}_{tag}_{slug}"
+            html = await self._page.evaluate("document.documentElement.outerHTML")
+            Path(str(base) + ".html").write_text(html or "", encoding="utf-8")
+            try:
+                await self._page.save_screenshot(str(base) + ".png")
+            except Exception as e:
+                logger.debug("[boatshop24] Screenshot fehlgeschlagen: %s", e)
+            logger.info("[boatshop24] Debug-Dump: %s.{html,png}", base)
+        except Exception as e:
+            logger.debug("[boatshop24] Debug-Dump fehlgeschlagen: %s", e)
+
     # ── BaseScraper overrides ───────────────────────────────────────
 
     def fetch_page(self, url: str) -> BeautifulSoup | None:
         """Load a page via headless Chrome (nodriver)."""
+        if self._maintenance:
+            return None
         try:
             html = _run_async(self._navigate(
                 url, wait_selector='h1, script[type="application/ld+json"]'
@@ -130,7 +214,7 @@ class Boatshop24Scraper(BaseScraper):
 
             try:
                 html = _run_async(self._navigate(
-                    search_url, wait_selector="a[href*='/boat/']"
+                    search_url, wait_selector="a.grid-listing-link, a[href*='/boat/'], a[href*='/yacht/']"
                 ))
             except Exception as e:
                 logger.warning("[boatshop24] Fehler Suchseite %d: %s", page, e)
@@ -161,13 +245,13 @@ class Boatshop24Scraper(BaseScraper):
         urls = []
 
         # BoatsGroup sites use grid-listing-link with data-ssr-meta
-        cards = soup.select("a.grid-listing-link, a[href*='/boat/']")
+        cards = soup.select("a.grid-listing-link, a[href*='/boat/'], a[href*='/yacht/']")
         logger.info("[boatshop24] %d Listing-Cards auf der Seite", len(cards))
 
         seen = set()
         for card in cards:
             href = card.get("href", "")
-            if not href or "/boat/" not in href:
+            if not href or ("/boat/" not in href and "/yacht/" not in href):
                 continue
 
             full_url = href if href.startswith("http") else self.BASE_URL + href

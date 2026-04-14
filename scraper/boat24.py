@@ -1,5 +1,8 @@
+import asyncio
 import logging
+import random
 import re
+import time
 
 from bs4 import BeautifulSoup
 
@@ -7,6 +10,19 @@ from models import BoatListing
 from scraper.base import BaseScraper
 
 logger = logging.getLogger(__name__)
+
+
+def _run_async(coro):
+    """Run an async coroutine from sync code."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                return pool.submit(asyncio.run, coro).result()
+        return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
 
 
 class Boat24Scraper(BaseScraper):
@@ -18,11 +34,93 @@ class Boat24Scraper(BaseScraper):
         "?prs=eur&prn=0&prx={max_price}&cur=EUR&page={page}"
     )
 
-    def get_listing_urls(self, max_price: int) -> list[str]:
-        urls: list[str] = []
-        page = 1
+    def __init__(self) -> None:
+        super().__init__()
+        self._browser = None
+        self._page = None
 
-        while True:
+    # ── Browser management ──────────────────────────────────────────
+
+    async def _ensure_browser(self):
+        if self._browser is None:
+            import nodriver as nd
+            self._browser = await nd.start(headless=False)
+        return self._browser
+
+    async def _navigate(self, url: str, wait_selector: str = "") -> str:
+        """Navigate in the same tab (preserves session cookies)."""
+        browser = await self._ensure_browser()
+
+        if self._page is None:
+            self._page = await browser.get(url)
+        else:
+            await self._page.get(url)
+
+        # Wait for Cloudflare / bot-check to resolve
+        for _ in range(20):
+            await asyncio.sleep(3)
+            title = await self._page.evaluate("document.title")
+            if title and "moment" not in title.lower() and "checking" not in title.lower():
+                break
+        else:
+            logger.warning("[boat24] Challenge nicht gelöst für %s", url)
+            return await self._page.evaluate("document.documentElement.outerHTML")
+
+        # Wait for specific content
+        if wait_selector:
+            for _ in range(10):
+                await asyncio.sleep(2)
+                try:
+                    found = await self._page.evaluate(
+                        f"document.querySelectorAll('{wait_selector}').length"
+                    )
+                    if isinstance(found, (int, float)) and found > 0:
+                        break
+                except Exception:
+                    pass
+        else:
+            await asyncio.sleep(5)
+
+        return await self._page.evaluate("document.documentElement.outerHTML")
+
+    def _long_pause(self) -> None:
+        delay = random.uniform(4.0, 7.0)
+        time.sleep(delay)
+
+    # ── BaseScraper overrides ───────────────────────────────────────
+
+    def fetch_page(self, url: str) -> BeautifulSoup | None:
+        """Load a page via headless Chrome (nodriver)."""
+        try:
+            html = _run_async(self._navigate(
+                url, wait_selector="h1, [class*='blurb'], [class*='detail']"
+            ))
+            soup = BeautifulSoup(html, "html.parser")
+            title = soup.select_one("title")
+            if title and "moment" in (title.get_text(strip=True) or "").lower():
+                logger.warning("[boat24] Cloudflare blockiert %s", url)
+                return None
+            return soup
+        except Exception as e:
+            logger.warning("[boat24] Fehler beim Laden von %s: %s", url, e)
+            return None
+
+    def get_listing_urls(self, max_price: int) -> list[str]:
+        # Warm up: visit homepage to establish session
+        logger.info("[boat24] Warmup: Lade Homepage...")
+        try:
+            _run_async(self._navigate(self.BASE_URL + "/en/", wait_selector="nav"))
+            logger.info("[boat24] Homepage geladen, starte Suche")
+            self._long_pause()
+        except Exception as e:
+            logger.warning("[boat24] Homepage-Warmup fehlgeschlagen: %s", e)
+
+        urls: list[str] = []
+        seen_urls: set[str] = set()
+        page = 1
+        max_pages = 50
+
+        while page <= max_pages:
             search_url = self.SEARCH_URL.format(max_price=max_price, page=page)
             soup = self.fetch_page(search_url)
             if soup is None:
@@ -34,19 +132,31 @@ class Boat24Scraper(BaseScraper):
             for link in links:
                 href = link.get("href", "")
                 if href and "/detail/" in href:
+                    # Normalize: strip query parameters for dedup
                     full_url = href if href.startswith("http") else self.BASE_URL + href
-                    if full_url not in urls and full_url not in new_urls:
+                    clean_url = full_url.split("?")[0]
+                    if clean_url not in seen_urls:
+                        seen_urls.add(clean_url)
                         new_urls.append(full_url)
 
             if not new_urls:
+                logger.info("[boat24] Seite %d: Keine neuen Inserate, stoppe", page)
                 break
 
             urls.extend(new_urls)
             logger.info("[boat24] Seite %d: %d Inserate gefunden", page, len(new_urls))
             page += 1
-            self.pause()
+            self._long_pause()
 
-        return list(dict.fromkeys(urls))  # dedupe, preserve order
+        logger.info("[boat24] Insgesamt %d Inserate gesammelt", len(urls))
+        return urls
+
+    def __del__(self):
+        if self._browser:
+            try:
+                self._browser.stop()
+            except Exception:
+                pass
 
     def parse_listing(self, url: str, soup: BeautifulSoup) -> BoatListing:
         listing = BoatListing(url=url, plattform=self.platform_name)
